@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pyc
+.env
+.env.*
+logs/
+data/raw/
+data/processed/
+*.egg-info/
+.DS_Store
+target/
+dbt_packages/
+/data/

@@ -1,0 +1,149 @@
+version: 2
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+# Declare the raw CDM tables that the ETL pipeline writes to BigQuery.
+# dbt uses these to generate source freshness checks and lineage graphs.
+
+sources:
+  - name: social_fitness_staging
+    database: "{{ env_var('GCP_PROJECT_ID', 'social-fitness-prod') }}"
+    schema:   social_fitness_staging
+    description: "CDM tables written by the ETL pipeline (Python + Cloud Functions)"
+
+    freshness:
+      warn_after:  {count: 25, period: hour}
+      error_after: {count: 49, period: hour}
+
+    tables:
+      - name: cdm_paid_media_daily
+        description: "Unified paid media rows — TikTok, Meta, Reddit — one row per ad × day"
+        loaded_at_field: _extracted_at
+        columns:
+          - name: date
+            description: "UTC date of the ad delivery"
+            tests: [not_null]
+          - name: platform
+            tests:
+              - not_null
+              - accepted_values:
+                  values: [tiktok, instagram_meta, reddit]
+          - name: cost_usd
+            tests: [not_null]
+          - name: attribution_window
+            description: "CRITICAL: Reddit uses 30d_click vs 7d_click for TikTok/Meta. Do not compare installs cross-platform without normalizing."
+            tests:
+              - accepted_values:
+                  values: [7d_click_1d_view, 30d_click]
+
+      - name: cdm_installs
+        description: "AppsFlyer install attribution — one row per install with funnel flags"
+        loaded_at_field: _extracted_at
+        columns:
+          - name: appsflyer_id
+            tests: [not_null, unique]
+          - name: install_date
+            tests: [not_null]
+          - name: channel
+            tests: [not_null]
+          - name: att_status
+            description: "iOS App Tracking Transparency consent. SKAN rows (att_status=denied) cannot be joined to user-level event data."
+            tests:
+              - accepted_values:
+                  values: [authorized, denied, not_determined, not_applicable]
+
+      - name: cdm_organic_daily
+        description: "Organic content performance — Instagram, TikTok, Reddit"
+        loaded_at_field: _extracted_at
+        columns:
+          - name: date
+            tests: [not_null]
+          - name: platform
+            tests:
+              - not_null
+              - accepted_values:
+                  values: [instagram, tiktok, reddit]
+          - name: avg_watch_time_s
+            description: "Watch time in SECONDS. Instagram values are pre-converted from milliseconds in the transformer. Reddit is always NULL."
+
+      - name: cdm_funnel_events
+        description: "In-app event log from AppsFlyer — one row per event"
+        loaded_at_field: _extracted_at
+
+# ── Staging models ────────────────────────────────────────────────────────────
+
+models:
+  - name: stg_paid_media
+    description: "Cleaned paid media CDM — types enforced, efficiency metrics recomputed from actuals"
+    columns:
+      - name: date
+        tests: [not_null]
+      - name: platform
+        tests: [not_null]
+      - name: cost_usd
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+      - name: ctr
+        description: "Click-through rate. Should be < 0.5 (50%) — higher values indicate data issues."
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "< 0.5"
+
+  - name: stg_installs
+    description: "Cleaned install attribution — primary attribution only, types enforced"
+    columns:
+      - name: appsflyer_id
+        tests: [not_null]
+      - name: install_date
+        tests: [not_null]
+      - name: is_primary_attribution
+        description: "Always TRUE in this view (filtered at staging)"
+
+  - name: stg_organic
+    description: "Cleaned organic content — blended_engagement_rate recomputed consistently"
+
+  - name: mart_channel_performance_daily
+    description: "Channel-level daily performance — campaign × day aggregation"
+    columns:
+      - name: date
+        tests: [not_null]
+      - name: platform
+        tests: [not_null]
+      - name: cost_usd
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+
+  - name: mart_funnel_by_channel
+    description: "Monthly cohort funnel with full conversion rates and LTV metrics"
+    columns:
+      - name: cohort_month
+        tests: [not_null]
+      - name: overall_cvr
+        description: "install-to-subscription CVR. Healthy threshold: >= 0.05 (5%)"
+      - name: funnel_status
+        tests:
+          - accepted_values:
+              values: [healthy, watch, at_risk]
+
+  - name: mart_ltv_cohort
+    description: "Monthly cohort LTV — join to mart_channel_performance_daily on cohort_month + channel for LTV/CAC"
+    columns:
+      - name: cohort_month
+        tests: [not_null]
+      - name: ltv_per_install
+        description: "Revenue per install. For LTV/CAC ratio: ltv_per_install / (spend / installs)"
+
+  - name: mart_organic_performance
+    description: "Monthly organic content aggregation by platform and content type"
+
+  - name: rpt_executive_summary
+    description: "Weekly executive KPIs — paid + organic combined"
+
+  - name: rpt_platform_comparison
+    description: "Platform-level efficiency comparison for the full reporting period"
+
+  - name: rpt_funnel_health
+    description: "Current funnel health status for alerting — last 2 months"

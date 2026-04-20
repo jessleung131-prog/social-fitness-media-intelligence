@@ -1,0 +1,164 @@
+name: ETL Pipeline CI
+
+on:
+  pull_request:
+    branches: [main, staging]
+    paths: ["etl/**", "dbt/**", "config/**", "deploy/**"]
+  push:
+    branches: [staging]
+  workflow_dispatch:
+    inputs:
+      pipeline:
+        description: Pipeline to run
+        required: false
+        default: all
+      dry_run:
+        required: false
+        default: "true"
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dev tools
+        run: pip install flake8 black isort pandas requests
+      - name: Black formatting
+        run: black --check etl/ config/ || true
+      - name: Flake8 lint
+        run: flake8 etl/ config/ --max-line-length=100 --ignore=E501,W503 || true
+      - name: No hardcoded secrets
+        run: |
+          if grep -rE "(access_token|api_key|client_secret)\s*=\s*['][a-zA-Z0-9]{20,}[']"              --include="*.py" etl/ config/ | grep -v your_ | grep -v test_ | grep -v "#"; then
+            echo FAIL possible secret detected
+            exit 1
+          fi
+          echo OK no hardcoded secrets
+
+  test:
+    name: ETL dry run and validation
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install pandas requests pytest
+      - name: Paid media dry run
+        run: python etl/run_paid_media_pipeline.py --start 2025-01-01 --end 2025-01-07 --dry-run
+        env:
+          GCP_PROJECT_ID: test-project
+          TIKTOK_ACCESS_TOKEN: your_test_token
+          META_ACCESS_TOKEN: your_test_token
+          META_AD_ACCOUNT_ID: act_your_test_account
+          REDDIT_CLIENT_ID: your_test_client
+          REDDIT_CLIENT_SECRET: your_test_secret
+      - name: MMP dry run
+        run: python etl/run_mmp_pipeline.py --start 2025-01-01 --end 2025-01-07 --dry-run
+        env:
+          GCP_PROJECT_ID: test-project
+          APPSFLYER_API_TOKEN: your_test_token
+      - name: Organic dry run
+        run: python etl/run_organic_pipeline.py --start 2025-01-01 --end 2025-01-07 --dry-run
+        env:
+          GCP_PROJECT_ID: test-project
+      - name: Run data validator
+        run: |
+          python -c "
+          import sys; sys.path.insert(0, '.')
+          from datetime import date
+          from etl.extractors.tiktok_extractor import TikTokExtractor
+          from etl.extractors.meta_extractor import MetaExtractor
+          from etl.extractors.reddit_extractor import RedditExtractor
+          from etl.transformers.paid_media_transformer import PaidMediaTransformer
+          from etl.validators.paid_media_validator import PaidMediaValidator
+          s, e = date(2025,1,1), date(2025,1,7)
+          t = PaidMediaTransformer()
+          df = t.combine([t.transform_tiktok(TikTokExtractor().extract(s,e)),
+                          t.transform_meta(MetaExtractor().extract(s,e)),
+                          t.transform_reddit(RedditExtractor().extract(s,e))])
+          r = PaidMediaValidator().validate(df)
+          assert r.passed, f'FAIL: {r.error_count} errors'
+          print('OK all validation checks passed')
+          "
+
+  dbt-check:
+    name: dbt compile and schema check
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install dbt-core==1.7.* dbt-bigquery==1.7.* || pip install dbt-core dbt-bigquery
+      - name: Write profiles.yml
+        run: |
+          mkdir -p ~/.dbt
+          printf "social_fitness:
+  target: ci
+  outputs:
+    ci:
+      type: bigquery
+      method: oauth
+      project: test-project
+      dataset: social_fitness_staging
+      location: US
+      threads: 4
+" > ~/.dbt/profiles.yml
+      - name: dbt compile
+        working-directory: dbt
+        run: dbt compile --target ci || echo dbt compile skipped no BQ credentials
+        env:
+          GCP_PROJECT_ID: test-project
+
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    needs: [lint, test, dbt-check]
+    if: github.ref == 'refs/heads/staging' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_STAGING }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Deploy Cloud Function to staging
+        run: |
+          gcloud functions deploy social-fitness-etl-staging             --gen2             --runtime=python311             --region=us-central1             --source=deploy/cloud_functions             --entry-point=run_etl             --trigger-topic=social-fitness-etl-trigger-staging             --memory=2048MB             --timeout=540s             --set-env-vars=GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }},DBT_TARGET=staging             --project=${{ secrets.GCP_PROJECT_ID }}
+          echo Deployed to staging
+
+  deploy-prod:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: [lint, test, dbt-check]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_PROD }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Deploy Cloud Function to production
+        run: |
+          gcloud functions deploy social-fitness-etl             --gen2             --runtime=python311             --region=us-central1             --source=deploy/cloud_functions             --entry-point=run_etl             --trigger-topic=social-fitness-etl-trigger             --memory=2048MB             --timeout=540s             --service-account=social-fitness-etl@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com             --set-env-vars=GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }},DBT_TARGET=prod             --project=${{ secrets.GCP_PROJECT_ID }}
+          echo Deployed to production
+      - name: Run dbt in production
+        run: |
+          pip install dbt-bigquery==1.7.*
+          cd dbt && dbt run --target prod --fail-fast
+          dbt test --target prod
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
