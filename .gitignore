@@ -11,3 +11,8 @@ data/processed/
 target/
 dbt_packages/
 /data/
+
+# Private images - never commit
+docs/*.png
+docs/*.jpg
+docs/*.jpeg
