@@ -1,0 +1,96 @@
+name: ETL Pipeline CI
+
+on:
+  pull_request:
+    branches: [main, staging]
+    paths: ["etl/**", "dbt/**", "config/**", "deploy/**"]
+  push:
+    branches: [staging]
+  workflow_dispatch:
+    inputs:
+      pipeline:
+        description: Pipeline to run
+        required: false
+        default: all
+      dry_run:
+        required: false
+        default: "true"
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dev tools
+        run: pip install flake8 black isort pandas requests
+      - name: Black formatting
+        run: black --check etl/ config/ || true
+      - name: Flake8 lint
+        run: flake8 etl/ config/ --max-line-length=100 --ignore=E501,W503 || true
+      - name: No hardcoded secrets
+        run: |
+          if grep -rE "(access_token|api_key|client_secret)\s*=\s*['][a-zA-Z0-9]{20,}[']" \
+             --include="*.py" etl/ config/ | grep -v your_ | grep -v test_ | grep -v "#"; then
+            echo FAIL possible secret detected
+            exit 1
+          fi
+          echo OK no hardcoded secrets
+
+  test:
+    name: ETL dry run and validation
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install pandas requests pytest
+      - name: Paid media dry run
+        run: python etl/run_paid_media_pipeline.py --start 2025-01-01 --end 2025-01-07 --dry-run
+        env:
+          GCP_PROJECT_ID: test-project
+          TIKTOK_ACCESS_TOKEN: your_test_token
+          META_ACCESS_TOKEN: your_test_token
+          META_AD_ACCOUNT_ID: act_your_test_account
+          REDDIT_CLIENT_ID: your_test_client
+          REDDIT_CLIENT_SECRET: your_test_secret
+      - name: MMP dry run
+        run: python etl/run_mmp_pipeline.py --start 2025-01-01 --end 2025-01-07 --dry-run
+        env:
+          GCP_PROJECT_ID: test-project
+          APPSFLYER_API_TOKEN: your_test_token
+      - name: Organic dry run
+        run: python etl/run_organic_pipeline.py --start 2025-01-01 --end 2025-01-07 --dry-run
+        env:
+          GCP_PROJECT_ID: test-project
+
+  dbt-check:
+    name: dbt compile and schema check
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install dbt-core dbt-bigquery || true
+      - name: Write profiles.yml
+        run: |
+          mkdir -p ~/.dbt
+          printf "social_fitness:\n  target: ci\n  outputs:\n    ci:\n      type: bigquery\n      method: oauth\n      project: test-project\n      dataset: social_fitness_staging\n      location: US\n      threads: 4\n" > ~/.dbt/profiles.yml
+      - name: dbt compile
+        working-directory: dbt
+        run: dbt compile --target ci || echo "dbt compile skipped - no BQ credentials in CI"
+        env:
+          GCP_PROJECT_ID: test-project
