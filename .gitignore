@@ -16,3 +16,6 @@ dbt_packages/
 docs/*.png
 docs/*.jpg
 docs/*.jpeg
+
+# Allow PPTX in docs
+!docs/*.pptx
